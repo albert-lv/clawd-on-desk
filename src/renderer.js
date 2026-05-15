@@ -430,10 +430,35 @@ window.electronAPI.onMiniModeChange((enabled, edge, options) => {
   } else {
     removeGlyphFlipCompensation(clawdEl);
   }
+  if (!enabled) applyMiniClip(null);
   if (shouldUseCloudlingPointerBridge(currentState, currentDisplayedSvg) && lastCloudlingPointerPayload) {
     applyCloudlingPointerBridge(lastCloudlingPointerPayload);
   }
 });
+
+// Multi-monitor seam clip: in mini mode at an internal seam, main sends the
+// fraction of the window width that falls on the local display. We clip the
+// rest away so the half that physically crosses onto the neighbouring
+// monitor renders nothing there — the local display keeps the half-body peek.
+function applyMiniClip(info) {
+  if (!container) return;
+  if (!info || !Number.isFinite(info.fraction)) {
+    container.style.clipPath = "";
+    return;
+  }
+  const f = Math.max(0, Math.min(1, info.fraction));
+  if (info.edge === "left") {
+    // Local display lies to the RIGHT of the seam — keep [f, 1], clip the left.
+    container.style.clipPath = `inset(0 0 0 ${f * 100}%)`;
+  } else {
+    // Local display lies to the LEFT of the seam — keep [0, f], clip the right.
+    container.style.clipPath = `inset(0 ${(1 - f) * 100}% 0 0)`;
+  }
+}
+
+if (window.electronAPI && typeof window.electronAPI.onMiniClip === "function") {
+  window.electronAPI.onMiniClip(applyMiniClip);
+}
 
 // Counter-flip asymmetric pixel-art glyphs (Zzz) inside SVG defs so they
 // render correctly when the container has scaleX(-1). Only the glyph shape
