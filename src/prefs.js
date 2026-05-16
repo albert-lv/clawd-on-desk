@@ -23,6 +23,10 @@ const { normalizeShortcuts, getDefaultShortcuts } = require("./shortcut-actions"
 const { isValidDisplaySnapshot } = require("./work-area");
 const { normalizeRemoteSsh, getDefaults: getRemoteSshDefaults } = require("./remote-ssh-profile");
 const {
+  cloneDefaultTelegramApproval,
+  normalizeTelegramApproval,
+} = require("./telegram-approval-settings");
+const {
   NOTIFICATION_DEFAULT_SECONDS,
   UPDATE_DEFAULT_SECONDS,
   PERMISSION_DEFAULT_SECONDS,
@@ -172,6 +176,11 @@ const SCHEMA = {
     type: "object",
     defaultFactory: () => getRemoteSshDefaults(),
     normalize: normalizeRemoteSsh,
+  },
+  tgApproval: {
+    type: "object",
+    defaultFactory: () => cloneDefaultTelegramApproval(),
+    normalize: normalizeTelegramApproval,
   },
 };
 

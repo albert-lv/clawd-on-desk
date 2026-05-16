@@ -58,6 +58,7 @@ function makeCtx(overrides = {}) {
     sendPermissionResponse: [],
     replyOpencodePermission: [],
     resolved: [],
+    maybeStartRemoteApproval: [],
   };
   const ctx = {
     doNotDisturb: false,
@@ -77,6 +78,7 @@ function makeCtx(overrides = {}) {
     },
     replyOpencodePermission: (payload) => calls.replyOpencodePermission.push(payload),
     resolvePermissionEntry: (entry, behavior, message) => calls.resolved.push({ entry, behavior, message }),
+    maybeStartRemoteApproval: (entry) => calls.maybeStartRemoteApproval.push(entry),
     ...overrides,
   };
   ctx.calls = calls;
@@ -211,6 +213,7 @@ describe("server-route-permission POST", () => {
       },
     ]]);
     assert.deepStrictEqual(res.ctx.calls.showPermissionBubble, [entry]);
+    assert.deepStrictEqual(res.ctx.calls.maybeStartRemoteApproval, [entry]);
   });
 
   it("silently drops disabled opencode permissions after ACK", async () => {
@@ -304,6 +307,7 @@ describe("server-route-permission POST", () => {
       { agentId: "pi" },
     ]]);
     assert.deepStrictEqual(res.ctx.calls.showPermissionBubble, [entry]);
+    assert.deepStrictEqual(res.ctx.calls.maybeStartRemoteApproval, [entry]);
     assert.deepStrictEqual(res.recorder.map((item) => item.outcome).filter(Boolean), ["accepted"]);
   });
 
@@ -324,6 +328,7 @@ describe("server-route-permission POST", () => {
     assert.strictEqual(res.statusCode, 204);
     assert.strictEqual(res.headers[CLAWD_SERVER_HEADER], CLAWD_SERVER_ID);
     assert.deepStrictEqual(res.ctx.pendingPermissions, []);
+    assert.deepStrictEqual(res.ctx.calls.maybeStartRemoteApproval, []);
   });
 
   it("pushes a normal Claude permission entry and shows the bubble", async () => {
@@ -350,6 +355,119 @@ describe("server-route-permission POST", () => {
       { agentId: "claude-code" },
     ]]);
     assert.deepStrictEqual(res.ctx.calls.showPermissionBubble, [entry]);
+    assert.deepStrictEqual(res.ctx.calls.maybeStartRemoteApproval, [entry]);
     assert.deepStrictEqual(res.recorder.map((item) => item.outcome).filter(Boolean), ["accepted"]);
+  });
+
+  it("starts remote approval only after a Claude bubble is shown", async () => {
+    const order = [];
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "claude-code",
+      session_id: "sid",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+    }), {
+      ctx: {
+        showPermissionBubble: () => order.push("bubble"),
+        maybeStartRemoteApproval: () => order.push("remote"),
+      },
+    });
+
+    assert.strictEqual(res.statusCode, null);
+    assert.deepStrictEqual(order, ["bubble", "remote"]);
+  });
+
+  it("does not start remote approval when a Claude bubble fails", async () => {
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "claude-code",
+      session_id: "sid",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+    }), {
+      ctx: {
+        showPermissionBubble: () => {
+          throw new Error("no window");
+        },
+      },
+    });
+
+    assert.strictEqual(res.destroyed, true);
+    assert.deepStrictEqual(res.ctx.pendingPermissions, []);
+    assert.deepStrictEqual(res.ctx.calls.maybeStartRemoteApproval, []);
+  });
+
+  it("returns terminal fallback when an elicitation bubble fails", async () => {
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "claude-code",
+      session_id: "sid",
+      tool_name: "AskUserQuestion",
+      tool_input: { questions: [{ question: "Continue?" }] },
+    }), {
+      ctx: {
+        showPermissionBubble: () => {
+          throw new Error("no window");
+        },
+      },
+    });
+
+    assert.strictEqual(res.statusCode, 200);
+    assert.deepStrictEqual(res.ctx.pendingPermissions, []);
+    assert.deepStrictEqual(res.ctx.calls.maybeStartRemoteApproval, []);
+    assert.deepStrictEqual(res.ctx.calls.sendPermissionResponse, [{
+      behavior: "deny",
+      message: "Elicitation bubble unavailable; answer in terminal",
+    }]);
+  });
+
+  it("keeps local Claude permission pending if remote approval startup throws", async () => {
+    const res = await callPermissionPost(JSON.stringify({
+      agent_id: "claude-code",
+      session_id: "sid",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+    }), {
+      ctx: {
+        maybeStartRemoteApproval: () => {
+          throw new Error("sidecar unavailable");
+        },
+      },
+    });
+
+    assert.strictEqual(res.statusCode, null);
+    assert.strictEqual(res.ctx.pendingPermissions.length, 1);
+    assert.match(res.ctx.calls.logs.join("\n"), /sidecar unavailable/);
+  });
+
+  it("does not start remote approval for elicitation, passthrough, DND, or opencode paths", async () => {
+    const cases = [
+      {
+        body: { tool_name: "ExitPlanMode", tool_input: { plan: "ship it" } },
+      },
+      {
+        body: { tool_name: "AskUserQuestion", tool_input: { questions: [] } },
+      },
+      {
+        body: { tool_name: "TaskList", tool_input: {} },
+        ctx: { PASSTHROUGH_TOOLS: new Set(["TaskList"]) },
+      },
+      {
+        body: { tool_name: "Bash", tool_input: { command: "npm test" } },
+        ctx: { doNotDisturb: true },
+      },
+      {
+        body: {
+          agent_id: "opencode",
+          tool_name: "Bash",
+          request_id: "req-1",
+          bridge_url: "http://127.0.0.1:1234",
+          bridge_token: "token",
+        },
+      },
+    ];
+
+    for (const item of cases) {
+      const res = await callPermissionPost(JSON.stringify(item.body), { ctx: item.ctx || {} });
+      assert.deepStrictEqual(res.ctx.calls.maybeStartRemoteApproval, [], item.body.tool_name);
+    }
   });
 });

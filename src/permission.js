@@ -645,6 +645,170 @@ function syncPermissionBubbleContent(permEntry) {
   return true;
 }
 
+function basenameForDisplay(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return "";
+  const parts = text.split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : text;
+}
+
+function compactRemoteApprovalText(value, maxLen = 200) {
+  let text = typeof value === "string" ? value : String(value == null ? "" : value);
+  text = text.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  text = text.replace(/\b\d+:[A-Za-z0-9_-]{20,}\b/g, "<redacted:telegram-token>");
+  text = text.replace(/\b(?:Bearer|Token)\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, "Bearer <redacted>");
+  text = text.replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,})\b/g, "<redacted:token>");
+  text = text.replace(/\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret)\s*[:=]\s*\S+/gi, "$1=<redacted>");
+  text = text.replace(/\b(?:telegram:)?-?\d{7,}(?::\d+){0,2}\b/g, "<redacted:id>");
+  if (text.length > maxLen) text = `${text.slice(0, Math.max(0, maxLen - 1))}…`;
+  return text;
+}
+
+function isRemoteApprovalActionable(permEntry) {
+  if (!permEntry || typeof permEntry !== "object") return false;
+  if (permEntry.isElicitation || permEntry.isCodexNotify || permEntry.isKimiNotify || permEntry.isOpencode) return false;
+  if (permEntry.toolName === "ExitPlanMode" || permEntry.toolName === "AskUserQuestion") return false;
+  if (PASSTHROUGH_TOOLS.has(permEntry.toolName)) return false;
+  // Headless sessions auto-deny locally; mirror that on the Telegram side so a
+  // non-interactive Codex/Pi/CC run never sends an actionable approval card.
+  const session = ctx.sessions && typeof ctx.sessions.get === "function"
+    ? ctx.sessions.get(permEntry.sessionId)
+    : null;
+  if (session && session.headless) return false;
+  return true;
+}
+
+// Returns a redacted summary string, or null when no agent-supplied description
+// is available. We refuse to send a Telegram approval card without something
+// describing the action — the local bubble shows the full tool input, so a
+// Telegram-only "Tool input hidden by Clawd." card would let the user approve
+// a black box.
+function buildRemoteApprovalSummary(permEntry) {
+  const input = permEntry && permEntry.toolInput && typeof permEntry.toolInput === "object"
+    ? permEntry.toolInput
+    : {};
+  const candidates = [
+    input.description,
+    input.summary,
+    input.reason,
+  ];
+  for (const candidate of candidates) {
+    const text = compactRemoteApprovalText(candidate, 200);
+    if (text) return text;
+  }
+  return null;
+}
+
+// Returns the Telegram approval payload, or null when there is no safe summary
+// to ship. Callers must treat null as a no-op signal — never send a card
+// without an action-describing summary.
+function buildRemoteApprovalPayload(permEntry) {
+  const summary = buildRemoteApprovalSummary(permEntry);
+  if (!summary) return null;
+  const agentId = compactRemoteApprovalText(permEntry.agentId || "claude-code", 80) || "claude-code";
+  const toolName = compactRemoteApprovalText(permEntry.toolName || "Unknown", 80) || "Unknown";
+  const session = ctx.sessions.get(permEntry.sessionId);
+  const sessionFolder = compactRemoteApprovalText(
+    basenameForDisplay((session && session.cwd) || permEntry.cwd || ""),
+    80
+  );
+  const detail = [
+    `Agent: ${agentId}`,
+    `Tool: ${toolName}`,
+    sessionFolder ? `Session: ${sessionFolder}` : null,
+    `Summary: ${summary}`,
+  ].filter(Boolean).join("\n");
+  return {
+    title: `${agentId} requests ${toolName}`,
+    detail,
+  };
+}
+
+function getTelegramApprovalClient() {
+  if (typeof ctx.getTelegramApprovalClient === "function") {
+    try { return ctx.getTelegramApprovalClient(); } catch (err) {
+      permLog(`telegram remote approval client lookup failed: ${compactRemoteApprovalText(err && err.message ? err.message : err, 200)}`);
+      return null;
+    }
+  }
+  return ctx.telegramApprovalClient || null;
+}
+
+function cancelRemoteApproval(permEntry) {
+  const controller = permEntry && permEntry.remoteApprovalAbortController;
+  if (!controller) return;
+  permEntry.remoteApprovalAbortController = null;
+  try { controller.abort(); } catch {}
+}
+
+// "Go to terminal" path: drop the bubble, abort any in-flight Telegram prompt,
+// hand focus back to the agent terminal. The HTTP res is intentionally NOT
+// answered here — the original socket-close abortHandler stays registered so
+// the agent's own disconnect drives final cleanup.
+function dismissPermissionForTerminal(perm) {
+  if (!perm) return;
+  // Cancel before splicing so a late Telegram decision can't slip in between
+  // the splice and the abort.
+  cancelRemoteApproval(perm);
+  const idx = pendingPermissions.indexOf(perm);
+  if (idx !== -1) pendingPermissions.splice(idx, 1);
+  if (perm.bubble && !perm.bubble.isDestroyed()) {
+    perm.bubble.webContents.send("permission-hide");
+    if (perm.hideTimer) clearTimeout(perm.hideTimer);
+    const bub = perm.bubble;
+    perm.hideTimer = setTimeout(() => { if (!bub.isDestroyed()) bub.destroy(); }, 250);
+  }
+  repositionBubbles();
+  repositionDependentBubbles();
+  syncPermissionShortcuts();
+  ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
+}
+
+function maybeStartRemoteApproval(permEntry) {
+  if (!isRemoteApprovalActionable(permEntry)) return false;
+  const client = getTelegramApprovalClient();
+  if (!client || typeof client.requestApproval !== "function") return false;
+  if (typeof client.isEnabled === "function" && !client.isEnabled()) return false;
+
+  const payload = buildRemoteApprovalPayload(permEntry);
+  if (!payload) return false;
+
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  if (controller) permEntry.remoteApprovalAbortController = controller;
+
+  let request;
+  try {
+    request = client.requestApproval(
+      payload,
+      controller ? { signal: controller.signal } : {}
+    );
+  } catch (err) {
+    if (controller && permEntry.remoteApprovalAbortController === controller) {
+      permEntry.remoteApprovalAbortController = null;
+    }
+    permLog(`telegram remote approval failed: ${compactRemoteApprovalText(err && err.message ? err.message : err, 200)}`);
+    return false;
+  }
+
+  Promise.resolve(request)
+    .then((decision) => {
+      if (decision !== "allow" && decision !== "deny") {
+        if (decision) permLog(`telegram remote approval ignored decision=${compactRemoteApprovalText(decision, 40)}`);
+        return;
+      }
+      resolvePermissionEntry(permEntry, decision);
+    })
+    .catch((err) => {
+      permLog(`telegram remote approval failed: ${compactRemoteApprovalText(err && err.message ? err.message : err, 200)}`);
+    })
+    .finally(() => {
+      if (controller && permEntry.remoteApprovalAbortController === controller) {
+        permEntry.remoteApprovalAbortController = null;
+      }
+    });
+  return true;
+}
+
   function resolvePermissionEntry(permEntry, behavior, message) {
     // Codex notify bubbles have no HTTP connection — route to dedicated cleanup
     if (permEntry.isCodexNotify || permEntry.isKimiNotify) {
@@ -653,6 +817,7 @@ function syncPermissionBubbleContent(permEntry) {
     }
   const idx = pendingPermissions.indexOf(permEntry);
   if (idx === -1) return;
+  cancelRemoteApproval(permEntry);
 
   // Minimum display time: if bubble just appeared and dismiss is automatic
   // (client disconnect / terminal answer), delay so user can see it briefly
@@ -967,20 +1132,7 @@ function handleDecide(event, behavior) {
     }
     resolvePermissionEntry(perm, "allow");
   } else if (behavior === "deny-and-focus") {
-    // Dismiss bubble without responding — let user decide in terminal.
-    // Keep abortHandler registered so socket cleanup happens when Claude Code disconnects.
-    const idx = pendingPermissions.indexOf(perm);
-    if (idx !== -1) pendingPermissions.splice(idx, 1);
-    if (perm.bubble && !perm.bubble.isDestroyed()) {
-      perm.bubble.webContents.send("permission-hide");
-      if (perm.hideTimer) clearTimeout(perm.hideTimer);
-      const bub = perm.bubble;
-      perm.hideTimer = setTimeout(() => { if (!bub.isDestroyed()) bub.destroy(); }, 250);
-    }
-    repositionBubbles();
-    repositionDependentBubbles();
-    syncPermissionShortcuts();
-    ctx.focusTerminalForSession(perm.sessionId, { fallbackEntry: buildPermissionFocusEntry(perm) });
+    dismissPermissionForTerminal(perm);
   } else {
     resolvePermissionEntry(perm, behavior === "allow" ? "allow" : "deny");
   }
@@ -1110,6 +1262,7 @@ function refreshPassiveNotifyAutoClose() {
 function dismissInteractivePermissionWithoutDecision(perm, reason) {
   const idx = pendingPermissions.indexOf(perm);
   if (idx !== -1) pendingPermissions.splice(idx, 1);
+  cancelRemoteApproval(perm);
   if (perm._delayTimer) { clearTimeout(perm._delayTimer); perm._delayTimer = null; }
   if (perm.autoCloseTimer) { clearTimeout(perm.autoCloseTimer); perm.autoCloseTimer = null; }
   if (perm.abortHandler && perm.res) {
@@ -1229,6 +1382,8 @@ return {
   showPermissionBubble, resolvePermissionEntry,
   sendPermissionResponse, repositionBubbles, permLog,
   pendingPermissions, PASSTHROUGH_TOOLS,
+  maybeStartRemoteApproval,
+  dismissPermissionForTerminal,
   handleBubbleHeight, handleDecide, cleanup,
   showCodexNotifyBubble, clearCodexNotifyBubbles,
   showKimiNotifyBubble, clearKimiNotifyBubbles,

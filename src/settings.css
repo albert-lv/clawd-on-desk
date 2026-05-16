@@ -2989,6 +2989,7 @@ html, body {
   color: var(--text-secondary);
 }
 .remote-ssh-field input[type="text"],
+.remote-ssh-field input[type="password"],
 .remote-ssh-field input[type="number"],
 .remote-ssh-field select {
   padding: 8px 10px;
@@ -3000,6 +3001,7 @@ html, body {
   font-family: inherit;
 }
 .remote-ssh-field input[type="text"]:focus,
+.remote-ssh-field input[type="password"]:focus,
 .remote-ssh-field input[type="number"]:focus,
 .remote-ssh-field select:focus {
   outline: 2px solid var(--accent);
@@ -3054,4 +3056,47 @@ html, body {
   font-size: 13px;
   color: var(--toast-error);
   cursor: help;
+}
+
+/* ── Telegram approval tab ── */
+.telegram-approval-status-row {
+  margin-bottom: 0;
+}
+.telegram-approval-token-row,
+.telegram-approval-config-row {
+  align-items: flex-start;
+}
+.telegram-approval-inline-form {
+  flex: 1 1 360px;
+  min-width: min(100%, 280px);
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.telegram-approval-input {
+  flex: 1 1 260px;
+  min-width: min(100%, 220px);
+  max-width: 420px;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: inherit;
+}
+.telegram-approval-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+.telegram-approval-form {
+  width: 100%;
+  display: grid;
+  gap: 12px;
+}
+.telegram-approval-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }

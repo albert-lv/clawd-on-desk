@@ -27,6 +27,7 @@ const TAB_MODULES = [
   path.join(SRC_DIR, "settings-tab-anim-map.js"),
   path.join(SRC_DIR, "settings-tab-anim-overrides.js"),
   path.join(SRC_DIR, "settings-tab-shortcuts.js"),
+  path.join(SRC_DIR, "settings-tab-telegram-approval.js"),
   path.join(SRC_DIR, "settings-tab-about.js"),
 ];
 
@@ -1041,6 +1042,7 @@ describe("settings renderer browser environment", () => {
       "settings-tab-anim-map.js",
       "settings-tab-anim-overrides.js",
       "settings-tab-shortcuts.js",
+      "settings-tab-telegram-approval.js",
       "settings-tab-about.js",
       "settings-tab-remote-ssh.js",
       "settings-doctor-modal.js",

@@ -31,6 +31,7 @@ describe("prefs.getDefaults", () => {
     assert.notStrictEqual(a.themeOverrides, b.themeOverrides);
     assert.notStrictEqual(a.shortcuts, b.shortcuts);
     assert.notStrictEqual(a.sessionAliases, b.sessionAliases);
+    assert.notStrictEqual(a.tgApproval, b.tgApproval);
     // Mutating one shouldn't affect the other
     a.agents["claude-code"].enabled = false;
     assert.strictEqual(b.agents["claude-code"].enabled, true);
@@ -59,6 +60,11 @@ describe("prefs.getDefaults", () => {
     assert.strictEqual(d.notificationBubbleAutoCloseSeconds, 6);
     assert.strictEqual(d.updateBubbleAutoCloseSeconds, 9);
     assert.deepStrictEqual(d.sessionAliases, {});
+    assert.deepStrictEqual(d.tgApproval, {
+      enabled: false,
+      allowedTgUserId: "",
+      targetSessionKey: "",
+    });
   });
 
   it("seeds all known agents as enabled", () => {
@@ -215,6 +221,23 @@ describe("prefs.validate", () => {
 
     assert.strictEqual(v.version, prefs.CURRENT_VERSION);
     assert.strictEqual(v.agents.pi.permissionsEnabled, true);
+  });
+
+  it("normalizes Telegram approval prefs without storing a token", () => {
+    const v = prefs.validate({
+      tgApproval: {
+        enabled: true,
+        allowedTgUserId: " 123456789 ",
+        targetSessionKey: "987654321",
+        botToken: "123:should-not-survive",
+      },
+    });
+    assert.deepStrictEqual(v.tgApproval, {
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:987654321",
+    });
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(v.tgApproval, "botToken"), false);
   });
 
   it("keeps valid fields verbatim", () => {
