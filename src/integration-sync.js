@@ -252,6 +252,21 @@ function createIntegrationSyncRuntime(options = {}) {
     }
   }
 
+  function syncNanoAgentHooks() {
+    try {
+      if (typeof ctx.syncNanoAgentHooksImpl === "function") return ctx.syncNanoAgentHooksImpl();
+      const { registerNanoAgentHooks } = require("../hooks/nano-agent-install.js");
+      const { added, updated } = registerNanoAgentHooks({ silent: true, port: getHookServerPort() });
+      if (added > 0 || updated > 0) {
+        console.log(`Clawd: synced Nano Agent hooks (added ${added}, updated ${updated})`);
+      }
+      return { status: "ok", added, updated };
+    } catch (err) {
+      console.warn("Clawd: failed to sync Nano Agent hooks:", err.message);
+      return { status: "error", message: err && err.message ? err.message : "Failed to sync Nano Agent hooks" };
+    }
+  }
+
   const AGENT_INTEGRATION_SYNCERS = Object.freeze({
     "gemini-cli": syncGeminiHooks,
     "cursor-agent": syncCursorHooks,
@@ -263,6 +278,7 @@ function createIntegrationSyncRuntime(options = {}) {
     pi: syncPiExtension,
     openclaw: syncOpenClawPlugin,
     hermes: syncHermesPlugin,
+    "nano-agent": syncNanoAgentHooks,
   });
 
   const AGENT_INTEGRATION_REPAIRERS = Object.freeze({
@@ -323,6 +339,7 @@ function createIntegrationSyncRuntime(options = {}) {
     syncPiExtension,
     syncOpenClawPlugin,
     syncHermesPlugin,
+    syncNanoAgentHooks,
     repairCodexHooks,
     repairOpenClawPlugin,
     syncIntegrationForAgent,
