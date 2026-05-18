@@ -136,7 +136,7 @@ function writeYamlAtomic(filePath, data) {
  * Check if an entry belongs to Clawd (by name prefix).
  */
 function isOurEntry(entry) {
-  return entry && entry.name && entry.name.startsWith(HOOK_NAME_PREFIX);
+  return !!(entry && entry.name && entry.name.startsWith(HOOK_NAME_PREFIX));
 }
 
 /**
