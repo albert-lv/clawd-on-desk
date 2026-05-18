@@ -143,6 +143,15 @@ FILES=(
   "$HOOKS_DIR/codex-subagent-fields.js"
   "$HOOKS_DIR/copilot-hook.js"
   "$HOOKS_DIR/copilot-install.js"
+  "$HOOKS_DIR/nano-agent-hook.js"
+  "$HOOKS_DIR/nano-agent-install.js"
+)
+
+# Node modules required by nano-agent-install.js
+NODE_MODULES_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/node_modules"
+NANO_NODE_MODULE_DIRS=(
+  "$NODE_MODULES_DIR/js-yaml"
+  "$NODE_MODULES_DIR/argparse"
 )
 
 # ── Local port detection ──
@@ -244,6 +253,42 @@ echo "Registering Copilot CLI hooks (remote mode)..."
 ssh "$SSH_TARGET" "$(remote_node_command copilot-install.js --remote)" || {
   echo "WARNING: Copilot CLI hook registration failed (Copilot CLI may not be installed on remote)"
 }
+
+# ── Deploy nano-agent dependencies ──
+
+NANO_DEPLOY_OK=1
+echo "Deploying nano-agent dependencies..."
+for dep_dir in "${NANO_NODE_MODULE_DIRS[@]}"; do
+  if [ ! -d "$dep_dir" ]; then
+    echo "WARNING: Missing local dependency: $dep_dir"
+    echo "         Run 'npm install' locally before deploying nano-agent hooks"
+    NANO_DEPLOY_OK=0
+    break
+  fi
+done
+
+if [ "$NANO_DEPLOY_OK" -eq 1 ]; then
+  ssh "$SSH_TARGET" "mkdir -p ~/.claude/hooks/node_modules" || {
+    echo "WARNING: Failed to create remote node_modules directory"
+    NANO_DEPLOY_OK=0
+  }
+fi
+
+if [ "$NANO_DEPLOY_OK" -eq 1 ]; then
+  scp -q -r "${NANO_NODE_MODULE_DIRS[@]}" "$SSH_TARGET:~/.claude/hooks/node_modules/" || {
+    echo "WARNING: Failed to copy nano-agent dependencies"
+    NANO_DEPLOY_OK=0
+  }
+fi
+
+if [ "$NANO_DEPLOY_OK" -eq 1 ]; then
+  echo "Registering nano-agent hooks (remote mode)..."
+  ssh "$SSH_TARGET" "$(remote_node_command nano-agent-install.js --remote)" || {
+    echo "WARNING: nano-agent hook registration failed (nano-agent may not be installed on remote)"
+  }
+else
+  echo "WARNING: Skipping nano-agent hook registration due to missing dependencies"
+fi
 
 # ── Print SSH configuration ──
 
