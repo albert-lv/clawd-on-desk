@@ -2,10 +2,10 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert");
 const {
   EVENT_TO_STATE,
-  snakeToPascal,
-  readNanoHookEnvelope,
+  readHookEnvelopeFromStdin,
   resolveEvent,
   buildStateBody,
+  buildHookSpecificOutput,
 } = require("../hooks/nano-agent-hook");
 
 const fakeResolve = () => ({
@@ -16,242 +16,157 @@ const fakeResolve = () => ({
   pidChain: [4242, 9999],
 });
 
-describe("Nano Agent hook", () => {
-  describe("snakeToPascal", () => {
-    it("converts snake_case to PascalCase", () => {
-      assert.strictEqual(snakeToPascal("pre_tool_use"), "PreToolUse");
-      assert.strictEqual(snakeToPascal("session_start"), "SessionStart");
-      assert.strictEqual(snakeToPascal("subagent_stop"), "SubagentStop");
-    });
-
-    it("returns null for empty or non-string input", () => {
-      assert.strictEqual(snakeToPascal(""), null);
-      assert.strictEqual(snakeToPascal(null), null);
-      assert.strictEqual(snakeToPascal(undefined), null);
-      assert.strictEqual(snakeToPascal(123), null);
-    });
-
-    it("handles already PascalCase input (no underscores)", () => {
-      assert.strictEqual(snakeToPascal("SessionStart"), "Sessionstart");
-      assert.strictEqual(snakeToPascal("PreToolUse"), "Pretooluse");
-    });
+describe("resolveEvent", () => {
+  it("resolves from argv[2]", () => {
+    const argv = ["node", "script.js", "SessionStart"];
+    assert.strictEqual(resolveEvent(argv, {}), "SessionStart");
   });
 
-  describe("readNanoHookEnvelope", () => {
-    it("parses NANO_HOOK_INPUT JSON", () => {
-      const env = {
-        NANO_HOOK_INPUT: JSON.stringify({
-          hook_event_name: "pre_tool_use",
-          session_id: "abc123",
-          tool_name: "Task",
-          params: { tool_input: { prompt: "test" } },
-        }),
-      };
-      const envelope = readNanoHookEnvelope(env);
-      assert.strictEqual(envelope.hook_event_name, "pre_tool_use");
-      assert.strictEqual(envelope.session_id, "abc123");
-      assert.strictEqual(envelope.tool_name, "Task");
-      assert.deepStrictEqual(envelope.params, { tool_input: { prompt: "test" } });
-    });
-
-    it("falls back to legacy NANO_TOOL_INPUT / NANO_TOOL_NAME", () => {
-      const env = {
-        NANO_HOOK_INPUT: JSON.stringify({}),
-        NANO_TOOL_INPUT: JSON.stringify({ prompt: "legacy" }),
-        NANO_TOOL_NAME: "LegacyTool",
-      };
-      const envelope = readNanoHookEnvelope(env);
-      assert.deepStrictEqual(envelope.params, { prompt: "legacy" });
-      assert.strictEqual(envelope.tool_name, "LegacyTool");
-    });
-
-    it("returns empty object on malformed JSON", () => {
-      const env = { NANO_HOOK_INPUT: "not json" };
-      const envelope = readNanoHookEnvelope(env);
-      assert.deepStrictEqual(envelope, {});
-    });
-
-    it("returns empty object when NANO_HOOK_INPUT is missing", () => {
-      const env = {};
-      const envelope = readNanoHookEnvelope(env);
-      assert.deepStrictEqual(envelope, {});
-    });
+  it("resolves from envelope.hook_event_name when argv missing", () => {
+    const argv = ["node", "script.js"];
+    const envelope = { hook_event_name: "PreToolUse" };
+    assert.strictEqual(resolveEvent(argv, envelope), "PreToolUse");
   });
 
-  describe("resolveEvent", () => {
-    it("resolves event from argv[2]", () => {
-      const argv = ["node", "script.js", "SessionStart"];
-      const env = {};
-      const envelope = {};
-      assert.strictEqual(resolveEvent(argv, env, envelope), "SessionStart");
-    });
-
-    it("resolves event from NANO_HOOK_EVENT env", () => {
-      const argv = ["node", "script.js"];
-      const env = { NANO_HOOK_EVENT: "PreToolUse" };
-      const envelope = {};
-      assert.strictEqual(resolveEvent(argv, env, envelope), "PreToolUse");
-    });
-
-    it("resolves event from envelope.hook_event_name", () => {
-      const argv = ["node", "script.js"];
-      const env = {};
-      const envelope = { hook_event_name: "post_tool_use" };
-      assert.strictEqual(resolveEvent(argv, env, envelope), "PostToolUse");
-    });
-
-    it("resolves event from envelope.event", () => {
-      const argv = ["node", "script.js"];
-      const env = {};
-      const envelope = { event: "session_end" };
-      assert.strictEqual(resolveEvent(argv, env, envelope), "SessionEnd");
-    });
-
-    it("normalizes snake_case to PascalCase", () => {
-      const argv = ["node", "script.js", "pre_compact"];
-      const env = {};
-      const envelope = {};
-      assert.strictEqual(resolveEvent(argv, env, envelope), "PreCompact");
-    });
-
-    it("returns null for unknown event", () => {
-      const argv = ["node", "script.js", "UnknownEvent"];
-      const env = {};
-      const envelope = {};
-      assert.strictEqual(resolveEvent(argv, env, envelope), null);
-    });
+  it("argv wins over envelope.hook_event_name", () => {
+    const argv = ["node", "script.js", "Stop"];
+    const envelope = { hook_event_name: "PreToolUse" };
+    assert.strictEqual(resolveEvent(argv, envelope), "Stop");
   });
 
-  describe("buildStateBody", () => {
-    it("builds complete state body for PreToolUse", () => {
-      const event = "PreToolUse";
-      const envelope = {
-        session_id: "test-session",
-        cwd: "/home/user/project",
-        tool_name: "write",
-        tool_use_id: "tool-123",
-        params: { tool_input: { path: "test.txt", content: "hello" } },
-      };
-      const body = buildStateBody(event, envelope, fakeResolve);
+  it("returns null for unknown event", () => {
+    const argv = ["node", "script.js", "UnknownEvent"];
+    assert.strictEqual(resolveEvent(argv, {}), null);
+  });
 
-      assert.strictEqual(body.state, "working");
-      assert.strictEqual(body.event, "PreToolUse");
-      assert.strictEqual(body.agent_id, "nano-agent");
-      assert.strictEqual(body.session_id, "test-session");
-      assert.strictEqual(body.cwd, "/home/user/project");
-      assert.strictEqual(body.tool_name, "write");
-      assert.strictEqual(body.tool_use_id, "tool-123");
-      assert.ok(body.tool_input_fingerprint);
-      assert.strictEqual(body.source_pid, 4242);
-      assert.strictEqual(body.agent_pid, 9999);
-      assert.strictEqual(body.nano_pid, 9999);
-    });
+  it("returns null for snake_case inputs", () => {
+    assert.strictEqual(resolveEvent(["node", "s.js", "pre_tool_use"], {}), null);
+    assert.strictEqual(resolveEvent(["node", "s.js", "session_start"], {}), null);
+  });
 
-    it("synthesizes SubagentStart for Task delegation", () => {
-      const event = "PreToolUse";
-      const envelope = {
-        session_id: "test-session",
-        tool_name: "Task",
-      };
-      const body = buildStateBody(event, envelope, fakeResolve);
+  it("returns null when only envelope.event is set (never consulted)", () => {
+    const argv = ["node", "script.js"];
+    const envelope = { event: "SessionStart" };
+    assert.strictEqual(resolveEvent(argv, envelope), null);
+  });
+});
 
-      assert.strictEqual(body.state, "juggling");
-      assert.strictEqual(body.event, "SubagentStart");
-      assert.strictEqual(body.tool_name, "Task");
-    });
+describe("buildStateBody", () => {
+  it("builds state body for PreToolUse with tool_input", () => {
+    const event = "PreToolUse";
+    const envelope = {
+      session_id: "test-session",
+      cwd: "/home/user/project",
+      tool_name: "write",
+      tool_use_id: "tool-123",
+      tool_input: { path: "test.txt", content: "hello" },
+    };
+    const body = buildStateBody(event, envelope, fakeResolve);
 
-    it("synthesizes SubagentStart for main_agent delegation", () => {
-      const event = "PreToolUse";
-      const envelope = { tool_name: "main_agent" };
-      const body = buildStateBody(event, envelope, fakeResolve);
+    assert.strictEqual(body.state, "working");
+    assert.strictEqual(body.event, "PreToolUse");
+    assert.strictEqual(body.agent_id, "nano-agent");
+    assert.strictEqual(body.session_id, "test-session");
+    assert.strictEqual(body.cwd, "/home/user/project");
+    assert.strictEqual(body.tool_name, "write");
+    assert.strictEqual(body.tool_use_id, "tool-123");
+    assert.ok(body.tool_input_fingerprint);
+    assert.strictEqual(body.source_pid, 4242);
+    assert.strictEqual(body.agent_pid, 9999);
+    assert.strictEqual(body.nano_pid, 9999);
+  });
 
-      assert.strictEqual(body.state, "juggling");
-      assert.strictEqual(body.event, "SubagentStart");
-    });
+  it("synthesizes SubagentStart for Task", () => {
+    const body = buildStateBody("PreToolUse", { tool_name: "Task" }, fakeResolve);
+    assert.strictEqual(body.state, "juggling");
+    assert.strictEqual(body.event, "SubagentStart");
+  });
 
-    it("synthesizes SubagentStart for spawn_agent delegation", () => {
-      const event = "PreToolUse";
-      const envelope = { tool_name: "spawn_agent" };
-      const body = buildStateBody(event, envelope, fakeResolve);
+  it("synthesizes SubagentStart for main_agent", () => {
+    const body = buildStateBody("PreToolUse", { tool_name: "main_agent" }, fakeResolve);
+    assert.strictEqual(body.state, "juggling");
+    assert.strictEqual(body.event, "SubagentStart");
+  });
 
-      assert.strictEqual(body.state, "juggling");
-      assert.strictEqual(body.event, "SubagentStart");
-    });
+  it("synthesizes SubagentStart for spawn_agent", () => {
+    const body = buildStateBody("PreToolUse", { tool_name: "spawn_agent" }, fakeResolve);
+    assert.strictEqual(body.state, "juggling");
+    assert.strictEqual(body.event, "SubagentStart");
+  });
 
-    it("does NOT synthesize SubagentStart for other tools", () => {
-      const event = "PreToolUse";
-      const envelope = { tool_name: "write" };
-      const body = buildStateBody(event, envelope, fakeResolve);
+  it("does NOT synthesize SubagentStart for other tools", () => {
+    const body = buildStateBody("PreToolUse", { tool_name: "write" }, fakeResolve);
+    assert.strictEqual(body.state, "working");
+    assert.strictEqual(body.event, "PreToolUse");
+  });
 
-      assert.strictEqual(body.state, "working");
-      assert.strictEqual(body.event, "PreToolUse");
-    });
+  it("defaults session_id to 'default' when absent", () => {
+    const body = buildStateBody("SessionStart", {}, fakeResolve);
+    assert.strictEqual(body.session_id, "default");
+  });
 
-    it("defaults to session_id='default' when missing", () => {
-      const event = "SessionStart";
-      const envelope = {};
-      const body = buildStateBody(event, envelope, fakeResolve);
+  it("returns null for unknown event", () => {
+    assert.strictEqual(buildStateBody("UnknownEvent", {}, fakeResolve), null);
+  });
 
-      assert.strictEqual(body.session_id, "default");
-    });
+  it("returns null for BinaryStop (intentionally omitted)", () => {
+    assert.strictEqual(buildStateBody("BinaryStop", {}, fakeResolve), null);
+  });
 
-    it("returns null for unknown event", () => {
-      const event = "UnknownEvent";
-      const envelope = {};
-      const body = buildStateBody(event, envelope, fakeResolve);
+  it("PermissionRequest yields needs-permission state", () => {
+    const body = buildStateBody("PermissionRequest", { tool_name: "bash", session_id: "s1" }, fakeResolve);
+    assert.strictEqual(body.state, "needs-permission");
+    assert.strictEqual(body.event, "PermissionRequest");
+    assert.strictEqual(body.tool_name, "bash");
+  });
 
-      assert.strictEqual(body, null);
-    });
-
-    it("uses host field in remote mode (no PID fields)", () => {
-      const originalEnv = process.env.CLAWD_REMOTE;
-      process.env.CLAWD_REMOTE = "1";
-
-      const event = "SessionStart";
-      const envelope = { session_id: "remote-session" };
-      const body = buildStateBody(event, envelope, fakeResolve);
-
+  it("remote mode: host populated, PID fields undefined", () => {
+    const originalEnv = process.env.CLAWD_REMOTE;
+    process.env.CLAWD_REMOTE = "1";
+    try {
+      const body = buildStateBody("SessionStart", { session_id: "remote-session" }, fakeResolve);
       assert.strictEqual(body.state, "idle");
-      assert.strictEqual(body.event, "SessionStart");
       assert.ok(body.host);
       assert.strictEqual(body.source_pid, undefined);
       assert.strictEqual(body.agent_pid, undefined);
       assert.strictEqual(body.nano_pid, undefined);
-
+    } finally {
       if (originalEnv !== undefined) process.env.CLAWD_REMOTE = originalEnv;
       else delete process.env.CLAWD_REMOTE;
-    });
+    }
   });
 
-  describe("EVENT_TO_STATE coverage", () => {
-    it("maps all NANO_COMMAND_HOOK_EVENTS to EVENT_TO_STATE", () => {
-      const NANO_COMMAND_HOOK_EVENTS = [
-        "session_start",
-        "session_end",
-        "user_prompt_submit",
-        "pre_tool_use",
-        "post_tool_use",
-        "post_tool_use_failure",
-        "stop",
-        "stop_failure",
-        "subagent_start",
-        "subagent_stop",
-        "pre_compact",
-        "post_compact",
-        "notification",
-      ];
+  it("omits tool_input_fingerprint when envelope.tool_input missing", () => {
+    const body = buildStateBody("PreToolUse", { tool_name: "read" }, fakeResolve);
+    assert.strictEqual(body.tool_input_fingerprint, undefined);
+  });
+});
 
-      for (const snakeEvent of NANO_COMMAND_HOOK_EVENTS) {
-        const pascalEvent = snakeToPascal(snakeEvent);
-        assert.ok(
-          EVENT_TO_STATE[pascalEvent],
-          `Missing EVENT_TO_STATE entry for ${snakeEvent} (${pascalEvent})`
-        );
-      }
-    });
+describe("buildHookSpecificOutput", () => {
+  it("allow decision yields correct JSON", () => {
+    const output = buildHookSpecificOutput({ behavior: "allow" });
+    const parsed = JSON.parse(output);
+    assert.strictEqual(parsed.hookSpecificOutput.hookEventName, "PermissionRequest");
+    assert.strictEqual(parsed.hookSpecificOutput.decision.behavior, "allow");
+  });
 
-    it("maps PermissionRequest HTTP hook event", () => {
-      assert.ok(EVENT_TO_STATE.PermissionRequest, "Missing EVENT_TO_STATE.PermissionRequest");
-    });
+  it("deny decision round-trips message", () => {
+    const output = buildHookSpecificOutput({ behavior: "deny", message: "Not allowed" });
+    const parsed = JSON.parse(output);
+    assert.strictEqual(parsed.hookSpecificOutput.decision.behavior, "deny");
+    assert.strictEqual(parsed.hookSpecificOutput.decision.message, "Not allowed");
+  });
+});
+
+describe("EVENT_TO_STATE coverage", () => {
+  it("has exactly 13 keys", () => {
+    const keys = Object.keys(EVENT_TO_STATE);
+    assert.strictEqual(keys.length, 13);
+  });
+
+  it("BinaryStop, Notification, PermissionDenied are all undefined", () => {
+    assert.strictEqual(EVENT_TO_STATE.BinaryStop, undefined);
+    assert.strictEqual(EVENT_TO_STATE.Notification, undefined);
+    assert.strictEqual(EVENT_TO_STATE.PermissionDenied, undefined);
   });
 });

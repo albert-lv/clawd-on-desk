@@ -26,7 +26,7 @@ const state = require("../src/state.js")({
 
 const VALID_STATES = new Set(Object.keys(state.STATE_PRIORITY));
 // Special internal values that agent maps are allowed to use
-const SPECIAL_VALUES = new Set(["codex-turn-end"]);
+const SPECIAL_VALUES = new Set(["codex-turn-end", "needs-permission"]);
 
 const REQUIRED_CAPABILITIES = ["httpHook", "permissionApproval", "sessionEnd", "subagent"];
 

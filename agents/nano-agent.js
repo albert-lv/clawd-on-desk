@@ -1,10 +1,9 @@
 // Nano Agent configuration (Go-based CLI)
-// Hook-based integration — payload via NANO_HOOK_INPUT env var
+// Hook-based integration — JSON envelope on stdin (post-PR-210 contract)
 // Settings: ~/.config/nano/config.yaml
 // Docs: nano-agent/docs/features/HOOKS.md
 //
-// Event names are snake_case (e.g. pre_tool_use, session_start) and must be
-// normalized to PascalCase (PreToolUse, SessionStart) before feeding state machine.
+// Event names are PascalCase (PreToolUse, SessionStart, etc.) — no snake_case normalization.
 
 module.exports = {
   id: "nano-agent",
@@ -17,23 +16,23 @@ module.exports = {
   eventSource: "hook",
   // PascalCase event names → state strings
   eventMap: {
-    SessionStart:          "idle",
-    SessionEnd:            "sleeping",
-    UserPromptSubmit:      "thinking",
-    PreToolUse:            "working",
-    PostToolUse:           "working",
-    PostToolUseFailure:    "error",
-    Stop:                  "attention",
-    StopFailure:           "error",
-    SubagentStart:         "juggling",
-    SubagentStop:          "working",
-    PreCompact:            "sweeping",
-    PostCompact:           "attention",
-    Notification:          "notification",
-    PermissionRequest:     "notification",
+    SessionStart:       "idle",
+    SessionEnd:         "idle",
+    UserPromptSubmit:   "working",
+    PreToolUse:         "working",
+    PostToolUse:        "working",
+    PostToolUseFailure: "working",
+    Stop:               "idle",
+    StopFailure:        "idle",
+    SubagentStart:      "juggling",
+    SubagentStop:       "working",
+    PreCompact:         "working",
+    PostCompact:        "working",
+    PermissionRequest:  "needs-permission",
+    Notification:       "notification",
   },
   capabilities: {
-    httpHook: true,
+    httpHook: false,
     permissionApproval: true,
     notificationHook: true,
     sessionEnd: true,
@@ -42,6 +41,6 @@ module.exports = {
   hookConfig: {
     configFormat: "nano-yaml",
   },
-  stdinFormat: "nanoHookEnv",
+  stdinFormat: "nanoHookJson",
   pidField: "nano_pid",
 };

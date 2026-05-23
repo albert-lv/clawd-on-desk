@@ -123,11 +123,17 @@ function getRuntimeStatus() {
   };
 }
 
+function getAgentPrefs(agentId) {
+  if (typeof ctx.getAgentPrefs === "function") return ctx.getAgentPrefs(agentId);
+  return {};
+}
+
 const integrationSync = createIntegrationSyncRuntime({
   ctx,
   getHookServerPort,
   shouldManageClaudeHooks,
   isAgentEnabled,
+  getAgentPrefs,
   startClaudeSettingsWatcher,
   stopClaudeSettingsWatcher,
 });
