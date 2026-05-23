@@ -178,7 +178,7 @@ function registerNanoAgentHooks(options = {}) {
       if (!options.silent) console.error(`Clawd: hooks.${event} is not a list (incompatible shape)`);
       return { status: "error", reason: "config-shape-incompatible" };
     }
-    if (!mapping[event]) mapping[event] = [];
+    if (list === undefined) mapping[event] = [];
 
     const desiredEntry = buildHookEntry(nodeBin, scriptPath, event, options);
     const existingIdx = mapping[event].findIndex((e) => isOurEntry(e));
