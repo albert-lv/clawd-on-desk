@@ -158,6 +158,43 @@ describe("buildHookSpecificOutput", () => {
   });
 });
 
+describe("readHookEnvelopeFromStdin", () => {
+  it("valid envelope returns parsed object", () => {
+    const result = readHookEnvelopeFromStdin(() => '{"hook_event_name":"PreToolUse","tool_name":"Bash"}');
+    assert.deepStrictEqual(result, { hook_event_name: "PreToolUse", tool_name: "Bash" });
+  });
+
+  it("empty stdin returns empty object", () => {
+    const result = readHookEnvelopeFromStdin(() => "");
+    assert.deepStrictEqual(result, {});
+  });
+
+  it("whitespace-only stdin returns empty object", () => {
+    const result = readHookEnvelopeFromStdin(() => "   \n  ");
+    assert.deepStrictEqual(result, {});
+  });
+
+  it("malformed JSON returns empty object", () => {
+    const result = readHookEnvelopeFromStdin(() => "{not json");
+    assert.deepStrictEqual(result, {});
+  });
+
+  it("non-object input (string) returns empty object", () => {
+    const result = readHookEnvelopeFromStdin(() => '"a string"');
+    assert.deepStrictEqual(result, {});
+  });
+
+  it("array input returns empty object", () => {
+    const result = readHookEnvelopeFromStdin(() => "[]");
+    assert.deepStrictEqual(result, {});
+  });
+
+  it("object with extra fields returns full parsed object", () => {
+    const result = readHookEnvelopeFromStdin(() => '{"hook_event_name":"Stop","random":1}');
+    assert.deepStrictEqual(result, { hook_event_name: "Stop", random: 1 });
+  });
+});
+
 describe("EVENT_TO_STATE coverage", () => {
   it("has exactly 13 keys", () => {
     const keys = Object.keys(EVENT_TO_STATE);
