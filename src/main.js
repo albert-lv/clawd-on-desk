@@ -1168,6 +1168,7 @@ const _serverCtx = {
   get STATE_SVGS() { return _state.STATE_SVGS; },
   get sessions() { return sessions; },
   isAgentEnabled: (agentId) => _isAgentEnabled({ agents: _settingsController.get("agents") }, agentId),
+  getAgentPrefs: (agentId) => { const agents = _settingsController.get("agents"); return (agents && agents[agentId]) || {}; },
   isAgentPermissionsEnabled: (agentId) => _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
   isCodexPermissionInterceptEnabled: () => _isCodexPermissionInterceptEnabled({ agents: _settingsController.get("agents") }),
   codexSubagentClassifier: agentRuntime.getCodexSubagentClassifier(),

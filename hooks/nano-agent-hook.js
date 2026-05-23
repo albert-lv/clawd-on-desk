@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-// Clawd — Nano Agent hook (payload via NANO_HOOK_INPUT env var)
+// Clawd — Nano Agent hook (JSON envelope on stdin, PascalCase events)
 // Registered in ~/.config/nano/config.yaml by hooks/nano-agent-install.js
 //
-// Nano Agent uses snake_case event names (pre_tool_use, session_start, etc.)
-// that must be normalized to PascalCase before feeding the Clawd state machine.
+// Post-PR-210 contract: stdin JSON envelope with hook_event_name as PascalCase.
+// For PermissionRequest, prints hookSpecificOutput JSON on stdout.
 
+const fs = require("fs");
 const crypto = require("crypto");
-const { postStateToRunningServer, readHostPrefix } = require("./server-config");
+const { postStateToRunningServer, readHostPrefix, readRuntimePort, DEFAULT_SERVER_PORT } = require("./server-config");
 const { createPidResolver, getPlatformConfig } = require("./shared-process");
 
 // Constants for tool input fingerprinting
@@ -15,81 +16,54 @@ const ARRAY_MAX = 16;
 const OBJECT_KEYS_MAX = 32;
 const DEPTH_MAX = 6;
 
-// snake_case → PascalCase event map for Nano Agent
+// PascalCase event → state mapping (13 entries; Notification has no state change)
 const EVENT_TO_STATE = {
-  SessionStart:          { state: "idle",         event: "SessionStart" },
-  SessionEnd:            { state: "sleeping",     event: "SessionEnd" },
-  UserPromptSubmit:      { state: "thinking",     event: "UserPromptSubmit" },
-  PreToolUse:            { state: "working",      event: "PreToolUse" },
-  PostToolUse:           { state: "working",      event: "PostToolUse" },
-  PostToolUseFailure:    { state: "error",        event: "PostToolUseFailure" },
-  Stop:                  { state: "attention",    event: "Stop" },
-  StopFailure:           { state: "error",        event: "StopFailure" },
-  SubagentStart:         { state: "juggling",     event: "SubagentStart" },
-  SubagentStop:          { state: "working",      event: "SubagentStop" },
-  PreCompact:            { state: "sweeping",     event: "PreCompact" },
-  PostCompact:           { state: "attention",    event: "PostCompact" },
-  Notification:          { state: "notification", event: "Notification" },
-  PermissionRequest:     { state: "notification", event: "PermissionRequest" },
+  SessionStart:       "idle",
+  SessionEnd:         "idle",
+  UserPromptSubmit:   "working",
+  PreToolUse:         "working",
+  PostToolUse:        "working",
+  PostToolUseFailure: "working",
+  Stop:               "idle",
+  StopFailure:        "idle",
+  SubagentStart:      "juggling",
+  SubagentStop:       "working",
+  PreCompact:         "working",
+  PostCompact:        "working",
+  PermissionRequest:  "needs-permission",
 };
 
 /**
- * Convert snake_case to PascalCase.
- * "pre_tool_use" → "PreToolUse"
- * Empty or non-string input returns null.
+ * Read hook envelope from stdin (JSON).
+ * Returns parsed object or {} on any error.
  */
-function snakeToPascal(snakeStr) {
-  if (!snakeStr || typeof snakeStr !== "string") return null;
-  return snakeStr
-    .split("_")
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
-    .join("");
-}
-
-/**
- * Read Nano Agent hook envelope from NANO_HOOK_INPUT env var.
- * Falls back to legacy NANO_TOOL_INPUT / NANO_TOOL_NAME if needed.
- * Returns empty object if parsing fails.
- */
-function readNanoHookEnvelope(env) {
-  const envCopy = env || process.env;
-  let envelope = {};
+function readHookEnvelopeFromStdin() {
   try {
-    const raw = envCopy.NANO_HOOK_INPUT;
-    if (raw) envelope = JSON.parse(raw);
-  } catch {}
-
-  // Fallback for legacy env vars
-  if (!envelope.params && envCopy.NANO_TOOL_INPUT) {
-    try {
-      envelope.params = JSON.parse(envCopy.NANO_TOOL_INPUT);
-    } catch {}
+    const raw = fs.readFileSync(0, "utf-8");
+    if (!raw || !raw.trim()) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed;
+  } catch {
+    return {};
   }
-  if (!envelope.tool_name && envCopy.NANO_TOOL_NAME) {
-    envelope.tool_name = envCopy.NANO_TOOL_NAME;
-  }
-
-  return envelope;
 }
 
 /**
- * Resolve event name from argv, env vars, or envelope.
- * Priority: argv[2] > NANO_HOOK_EVENT > envelope.hook_event_name > envelope.event
- * Each candidate is checked as-is, then snake_case→PascalCase normalized.
- * Returns null if no match found.
+ * Resolve event name from argv or envelope.
+ * Priority: argv[2] first, then envelope.hook_event_name.
+ * PascalCase only — snake_case returns null. envelope.event is never consulted.
  */
-function resolveEvent(argv, env, envelope) {
+function resolveEvent(argv, envelope) {
   const candidates = [
     argv && argv[2],
-    env && env.NANO_HOOK_EVENT,
     envelope && envelope.hook_event_name,
-    envelope && envelope.event,
   ].filter((c) => c && typeof c === "string");
 
   for (const candidate of candidates) {
-    if (EVENT_TO_STATE[candidate]) return candidate;
-    const pascal = snakeToPascal(candidate);
-    if (pascal && EVENT_TO_STATE[pascal]) return pascal;
+    if (EVENT_TO_STATE[candidate] !== undefined) return candidate;
+    // Special case: Notification is a valid event but not in EVENT_TO_STATE
+    if (candidate === "Notification") return candidate;
   }
   return null;
 }
@@ -99,7 +73,7 @@ function resolveEvent(argv, env, envelope) {
  * Truncates strings, limits array/object depth to avoid bloat.
  */
 function createToolInputFingerprint(toolInput) {
-  if (!toolInput) return "";
+  if (!toolInput || typeof toolInput !== "object") return undefined;
 
   function truncate(value, depth = 0) {
     if (depth > DEPTH_MAX) return "[depth]";
@@ -132,16 +106,15 @@ function createToolInputFingerprint(toolInput) {
 /**
  * Build state body for POST /state.
  * Special handling: PreToolUse + tool_name ∈ {Task, main_agent, spawn_agent} → SubagentStart.
+ * Returns null for unknown events (including BinaryStop) and Notification.
  */
 function buildStateBody(event, envelope, resolve) {
-  if (!event || !EVENT_TO_STATE[event]) return null;
+  if (!event || EVENT_TO_STATE[event] === undefined) return null;
 
-  const mapped = EVENT_TO_STATE[event];
-  let finalEvent = mapped.event;
-  let finalState = mapped.state;
+  let finalEvent = event;
+  let finalState = EVENT_TO_STATE[event];
 
   const toolName = envelope && envelope.tool_name;
-  const params = envelope && envelope.params;
 
   // Task delegation synthesis: PreToolUse + tool_name in delegation set → SubagentStart
   if (event === "PreToolUse" && toolName) {
@@ -165,19 +138,19 @@ function buildStateBody(event, envelope, resolve) {
   if (cwd) body.cwd = cwd;
   if (toolName) body.tool_name = toolName;
   if (envelope && envelope.tool_use_id) body.tool_use_id = envelope.tool_use_id;
-  if (params) {
-    body.tool_input_fingerprint = createToolInputFingerprint(params.tool_input || params);
-  }
+
+  const fingerprint = createToolInputFingerprint(envelope && envelope.tool_input);
+  if (fingerprint) body.tool_input_fingerprint = fingerprint;
 
   // Remote mode vs local mode
-  if (process.env.CLAWD_REMOTE) {
+  if (process.env.CLAWD_REMOTE === "1") {
     body.host = readHostPrefix();
   } else {
     const { stablePid, agentPid, detectedEditor, pidChain } = resolve();
     body.source_pid = stablePid;
     if (agentPid) {
       body.agent_pid = agentPid;
-      body.nano_pid = agentPid;  // pidField: "nano_pid" in agents/nano-agent.js
+      body.nano_pid = agentPid;
     }
     if (detectedEditor) body.editor = detectedEditor;
     if (pidChain && pidChain.length) body.pid_chain = pidChain;
@@ -186,11 +159,23 @@ function buildStateBody(event, envelope, resolve) {
   return body;
 }
 
-function main() {
-  const envelope = readNanoHookEnvelope(process.env);
-  const event = resolveEvent(process.argv, process.env, envelope);
+/**
+ * Build hookSpecificOutput JSON for PermissionRequest decision.
+ */
+function buildHookSpecificOutput(decision) {
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PermissionRequest",
+      decision,
+    },
+  });
+}
 
-  // Unknown event → silent exit (hook failure defaults to allow)
+function main() {
+  const envelope = readHookEnvelopeFromStdin();
+  const event = resolveEvent(process.argv, envelope);
+
+  // Unknown event → silent exit
   if (!event) {
     process.exit(0);
     return;
@@ -215,7 +200,79 @@ function main() {
     platformConfig: config,
   });
 
-  // SessionStart: preheat PID resolution
+  // Notification → POST to /notification and exit
+  if (event === "Notification") {
+    const body = {
+      agent_id: "nano-agent",
+      session_id: (envelope && envelope.session_id) || "default",
+      event: "Notification",
+      tool_name: envelope && envelope.tool_name,
+      message: envelope && envelope.message,
+    };
+    postStateToRunningServer(body, { timeoutMs: 100, path: "/notification" }, () => {
+      process.exit(0);
+    });
+    return;
+  }
+
+  // PermissionRequest → POST to /permission-request, await decision, print hookSpecificOutput
+  if (event === "PermissionRequest") {
+    const body = buildStateBody(event, envelope, resolve);
+    if (!body) { process.exit(0); return; }
+
+    // POST state first
+    postStateToRunningServer(body, { timeoutMs: 100 }, () => {});
+
+    // POST permission request and await decision
+    const permBody = {
+      agent_id: "nano-agent",
+      session_id: (envelope && envelope.session_id) || "default",
+      tool_name: envelope && envelope.tool_name,
+      tool_use_id: envelope && envelope.tool_use_id,
+      tool_input: envelope && envelope.tool_input,
+      cwd: envelope && envelope.cwd,
+    };
+    const http = require("http");
+    const port = readRuntimePort() || DEFAULT_SERVER_PORT;
+    const reqData = JSON.stringify(permBody);
+    const req = http.request({
+      hostname: "127.0.0.1",
+      port,
+      path: "/permission",
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(reqData) },
+      timeout: 600000,
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          const decision = JSON.parse(data);
+          const output = buildHookSpecificOutput(decision);
+          process.stdout.write(output + "\n");
+        } catch {
+          // Default to allow on parse failure
+          process.stdout.write(buildHookSpecificOutput({ behavior: "allow" }) + "\n");
+        }
+        process.exit(0);
+      });
+    });
+    req.on("error", () => {
+      // Server unreachable — allow by default
+      process.stdout.write(buildHookSpecificOutput({ behavior: "allow" }) + "\n");
+      process.exit(0);
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      process.stdout.write(buildHookSpecificOutput({ behavior: "allow" }) + "\n");
+      process.exit(0);
+    });
+    req.write(reqData);
+    req.end();
+    return;
+  }
+
+  // Regular state events
   if (event === "SessionStart" && !process.env.CLAWD_REMOTE) {
     resolve();
   }
@@ -234,10 +291,10 @@ function main() {
 // Export for testing
 module.exports = {
   EVENT_TO_STATE,
-  snakeToPascal,
-  readNanoHookEnvelope,
+  readHookEnvelopeFromStdin,
   resolveEvent,
   buildStateBody,
+  buildHookSpecificOutput,
 };
 
 if (require.main === module) {

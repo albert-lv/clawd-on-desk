@@ -6,10 +6,12 @@ const os = require("os");
 const {
   registerNanoAgentHooks,
   unregisterNanoAgentHooks,
-  NANO_COMMAND_HOOK_EVENTS,
-  NANO_HTTP_HOOK_EVENTS,
-  HOOK_NAME_PREFIX,
-  ensureSecurityHooksArray,
+  NANO_HOOK_EVENTS_BASE,
+  NANO_HOOK_EVENTS_OPTIONAL,
+  OUR_ID_PREFIX,
+  DEFAULT_HOOK_TIMEOUT_SECONDS,
+  PERMISSION_HOOK_TIMEOUT_SECONDS,
+  ensureHooksMapping,
   isOurEntry,
 } = require("../hooks/nano-agent-install");
 
@@ -50,52 +52,81 @@ describe("Nano Agent hook installer", () => {
     assert.strictEqual(result.reason, "config-missing");
   });
 
-  it("registers all command and HTTP hooks on fresh install", () => {
+  it("registers all 14 events with both optionals on", () => {
     const configPath = makeTempConfigFile({});
     const result = registerNanoAgentHooks({
       silent: true,
       configPath,
       nodeBin: "/usr/local/bin/node",
       scriptPath: "/opt/clawd/hooks/nano-agent-hook.js",
-      port: 23333,
+      permissionsEnabled: true,
+      notificationHookEnabled: true,
     });
 
-    // 13 command hooks + 1 HTTP hook = 14
     assert.strictEqual(result.status, "ok");
     assert.strictEqual(result.added, 14);
     assert.strictEqual(result.updated, 0);
     assert.strictEqual(result.skipped, 0);
 
     const config = readYaml(configPath);
-    assert.ok(config.security);
-    assert.ok(Array.isArray(config.security.hooks));
-    assert.strictEqual(config.security.hooks.length, 14);
+    assert.ok(config.hooks);
+    assert.ok(typeof config.hooks === "object" && !Array.isArray(config.hooks));
 
-    // Verify command hooks
-    const commandHooks = config.security.hooks.filter((h) => h.type === "command");
-    assert.strictEqual(commandHooks.length, 13);
-    for (const hook of commandHooks) {
-      assert.ok(hook.name.startsWith(HOOK_NAME_PREFIX));
-      assert.ok(hook.command.includes("/usr/local/bin/node"));
-      assert.ok(hook.command.includes("/opt/clawd/hooks/nano-agent-hook.js"));
-      assert.strictEqual(hook.enabled, true);
-      assert.strictEqual(hook.failure_policy, "allow");
-      assert.strictEqual(hook.async, true);
-      assert.ok(Array.isArray(hook.env_whitelist));
-      assert.ok(hook.env_whitelist.includes("CLAWD_REMOTE"));
+    // Verify all events have entries
+    for (const event of [...NANO_HOOK_EVENTS_BASE, ...NANO_HOOK_EVENTS_OPTIONAL]) {
+      assert.ok(Array.isArray(config.hooks[event]), `hooks.${event} should be an array`);
+      const entry = config.hooks[event].find((e) => e.id && e.id.startsWith(OUR_ID_PREFIX));
+      assert.ok(entry, `Missing Clawd entry for ${event}`);
+      assert.strictEqual(entry.id, `${OUR_ID_PREFIX}${event}`);
+      assert.strictEqual(entry.matcher, "*");
+      assert.ok(entry.command.includes("/usr/local/bin/node"));
+      assert.ok(entry.command.includes("/opt/clawd/hooks/nano-agent-hook.js"));
     }
 
-    // Verify HTTP hook
-    const httpHooks = config.security.hooks.filter((h) => h.type === "http");
-    assert.strictEqual(httpHooks.length, 1);
-    const permHook = httpHooks[0];
-    assert.ok(permHook.name.startsWith(HOOK_NAME_PREFIX));
-    assert.strictEqual(permHook.event, "permission_request");
-    assert.strictEqual(permHook.http.method, "POST");
-    assert.ok(permHook.http.url.includes("127.0.0.1:23333"));
-    assert.ok(permHook.http.url.includes("/permission"));
-    assert.strictEqual(permHook.http.timeout_seconds, 600);
-    assert.deepStrictEqual(permHook.http.url_allowlist, ["127.0.0.1", "localhost"]);
+    // Verify PermissionRequest has longer timeout
+    const permEntry = config.hooks.PermissionRequest[0];
+    assert.strictEqual(permEntry.timeout, PERMISSION_HOOK_TIMEOUT_SECONDS);
+
+    // Verify other events have default timeout
+    const startEntry = config.hooks.SessionStart[0];
+    assert.strictEqual(startEntry.timeout, DEFAULT_HOOK_TIMEOUT_SECONDS);
+
+    // No BinaryStop registered
+    assert.strictEqual(config.hooks.BinaryStop, undefined);
+  });
+
+  it("omits PermissionRequest when permissionsEnabled=false", () => {
+    const configPath = makeTempConfigFile({});
+    const result = registerNanoAgentHooks({
+      silent: true,
+      configPath,
+      nodeBin: "/usr/local/bin/node",
+      permissionsEnabled: false,
+      notificationHookEnabled: true,
+    });
+
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(result.added, 13);
+    const config = readYaml(configPath);
+    assert.strictEqual(config.hooks.PermissionRequest, undefined);
+    assert.ok(Array.isArray(config.hooks.Notification));
+  });
+
+  it("omits Notification when notificationHookEnabled=false", () => {
+    const configPath = makeTempConfigFile({});
+    const result = registerNanoAgentHooks({
+      silent: true,
+      configPath,
+      nodeBin: "/usr/local/bin/node",
+      permissionsEnabled: true,
+      notificationHookEnabled: false,
+    });
+
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(result.added, 13);
+    const config = readYaml(configPath);
+    assert.strictEqual(config.hooks.Notification, undefined);
+    assert.ok(Array.isArray(config.hooks.PermissionRequest));
   });
 
   it("is idempotent on second run", () => {
@@ -104,7 +135,8 @@ describe("Nano Agent hook installer", () => {
       silent: true,
       configPath,
       nodeBin: "/usr/local/bin/node",
-      port: 23333,
+      permissionsEnabled: true,
+      notificationHookEnabled: true,
     });
     assert.strictEqual(firstResult.added, 14);
 
@@ -112,7 +144,8 @@ describe("Nano Agent hook installer", () => {
       silent: true,
       configPath,
       nodeBin: "/usr/local/bin/node",
-      port: 23333,
+      permissionsEnabled: true,
+      notificationHookEnabled: true,
     });
 
     assert.strictEqual(secondResult.status, "ok");
@@ -121,20 +154,46 @@ describe("Nano Agent hook installer", () => {
     assert.strictEqual(secondResult.skipped, 14);
   });
 
-  it("updates stale hooks when node path or port changes", () => {
+  it("flipping permissionsEnabled off after install yields removed: 1", () => {
+    const configPath = makeTempConfigFile({});
+    registerNanoAgentHooks({
+      silent: true,
+      configPath,
+      nodeBin: "/usr/local/bin/node",
+      permissionsEnabled: true,
+      notificationHookEnabled: true,
+    });
+
+    const result = registerNanoAgentHooks({
+      silent: true,
+      configPath,
+      nodeBin: "/usr/local/bin/node",
+      permissionsEnabled: false,
+      notificationHookEnabled: true,
+    });
+
+    assert.strictEqual(result.removed, 1);
+    assert.strictEqual(result.skipped, 13);
+    const config = readYaml(configPath);
+    assert.strictEqual(config.hooks.PermissionRequest, undefined);
+  });
+
+  it("updates stale entries when nodeBin changes", () => {
     const configPath = makeTempConfigFile({});
     registerNanoAgentHooks({
       silent: true,
       configPath,
       nodeBin: "/old/node",
-      port: 23333,
+      permissionsEnabled: true,
+      notificationHookEnabled: true,
     });
 
     const result = registerNanoAgentHooks({
       silent: true,
       configPath,
       nodeBin: "/new/node",
-      port: 23334,
+      permissionsEnabled: true,
+      notificationHookEnabled: true,
     });
 
     assert.strictEqual(result.status, "ok");
@@ -143,45 +202,50 @@ describe("Nano Agent hook installer", () => {
     assert.strictEqual(result.skipped, 0);
 
     const config = readYaml(configPath);
-    const commandHook = config.security.hooks.find((h) => h.type === "command");
-    assert.ok(commandHook.command.includes("/new/node"));
-    assert.ok(!commandHook.command.includes("/old/node"));
-
-    const httpHook = config.security.hooks.find((h) => h.type === "http");
-    assert.ok(httpHook.http.url.includes("23334"));
-    assert.ok(!httpHook.http.url.includes("23333"));
+    const entry = config.hooks.SessionStart[0];
+    assert.ok(entry.command.includes("/new/node"));
+    assert.ok(!entry.command.includes("/old/node"));
   });
 
-  it("preserves user-defined hooks", () => {
-    const userHook = {
-      name: "user-custom-hook",
-      event: "pre_tool_use",
-      pattern: "*",
-      type: "command",
+  it("preserves user entries co-located under PreToolUse", () => {
+    const userEntry = {
+      id: "user-custom:PreToolUse",
+      matcher: "*.py",
       command: "echo 'user hook'",
-      enabled: true,
+      timeout: 10,
     };
     const configPath = makeTempConfigFile({
-      security: { hooks: [userHook], allow_rules: ["user-rule"] },
+      hooks: { PreToolUse: [userEntry] },
     });
 
     registerNanoAgentHooks({ silent: true, configPath, nodeBin: "/usr/local/bin/node" });
 
     const config = readYaml(configPath);
-    assert.ok(config.security.hooks.find((h) => h.name === "user-custom-hook"));
-    assert.deepStrictEqual(config.security.allow_rules, ["user-rule"]);
+    assert.strictEqual(config.hooks.PreToolUse.length, 2);
+    assert.ok(config.hooks.PreToolUse.find((e) => e.id === "user-custom:PreToolUse"));
   });
 
-  it("errors on incompatible config shape (security is scalar)", () => {
-    const configPath = makeTempConfigFile({ security: "not-an-object" });
+  it("preserves hooks.ralph across register call", () => {
+    const configPath = makeTempConfigFile({
+      hooks: { ralph: { loop_interval: 5, enabled: true } },
+    });
+
+    registerNanoAgentHooks({ silent: true, configPath, nodeBin: "/usr/local/bin/node" });
+
+    const config = readYaml(configPath);
+    assert.deepStrictEqual(config.hooks.ralph, { loop_interval: 5, enabled: true });
+  });
+
+  it("errors config-shape-incompatible when config.hooks is an array", () => {
+    const configPath = makeTempConfigFile({ hooks: ["not", "a", "mapping"] });
     const result = registerNanoAgentHooks({ silent: true, configPath });
     assert.strictEqual(result.status, "error");
     assert.strictEqual(result.reason, "config-shape-incompatible");
   });
 
-  it("errors on incompatible config shape (security.hooks is scalar)", () => {
-    const configPath = makeTempConfigFile({ security: { hooks: "not-an-array" } });
-    const result = registerNanoAgentHooks({ silent: true, configPath });
+  it("errors config-shape-incompatible when per-event value is not a list", () => {
+    const configPath = makeTempConfigFile({ hooks: { SessionStart: "not-a-list" } });
+    const result = registerNanoAgentHooks({ silent: true, configPath, nodeBin: "/usr/local/bin/node" });
     assert.strictEqual(result.status, "error");
     assert.strictEqual(result.reason, "config-shape-incompatible");
   });
@@ -199,76 +263,67 @@ describe("Nano Agent hook installer", () => {
     assert.strictEqual(result.added, 14);
 
     const config = readYaml(configPath);
-    const commandHook = config.security.hooks.find((h) => h.type === "command");
-    assert.ok(commandHook.command.startsWith("CLAWD_REMOTE=1 "));
+    const entry = config.hooks.SessionStart[0];
+    assert.ok(entry.command.startsWith("CLAWD_REMOTE=1 "));
   });
 
-  it("uninstalls all Clawd hooks", () => {
-    const configPath = makeTempConfigFile({});
+  it("uninstalls all Clawd entries; user entries + ralph survive", () => {
+    const userEntry = {
+      id: "user:PreToolUse",
+      matcher: "*",
+      command: "echo user",
+      timeout: 5,
+    };
+    const configPath = makeTempConfigFile({
+      hooks: {
+        ralph: { loop_interval: 5 },
+        PreToolUse: [userEntry],
+      },
+    });
     registerNanoAgentHooks({ silent: true, configPath, nodeBin: "/usr/local/bin/node" });
-
-    const config = readYaml(configPath);
-    const beforeCount = config.security.hooks.length;
-    assert.strictEqual(beforeCount, 14);
 
     const result = unregisterNanoAgentHooks({ silent: true, configPath });
     assert.strictEqual(result.status, "ok");
     assert.strictEqual(result.removed, 14);
 
-    const afterConfig = readYaml(configPath);
-    assert.strictEqual(afterConfig.security.hooks.length, 0);
-  });
-
-  it("uninstalls only Clawd hooks, preserves user hooks", () => {
-    const userHook = {
-      name: "user-block-rm",
-      event: "pre_tool_use",
-      type: "command",
-      command: "echo 'user'",
-    };
-    const configPath = makeTempConfigFile({ security: { hooks: [userHook] } });
-    registerNanoAgentHooks({ silent: true, configPath, nodeBin: "/usr/local/bin/node" });
-
     const config = readYaml(configPath);
-    assert.strictEqual(config.security.hooks.length, 15); // 14 Clawd + 1 user
-
-    unregisterNanoAgentHooks({ silent: true, configPath });
-
-    const afterConfig = readYaml(configPath);
-    assert.strictEqual(afterConfig.security.hooks.length, 1);
-    assert.strictEqual(afterConfig.security.hooks[0].name, "user-block-rm");
+    // ralph survives
+    assert.deepStrictEqual(config.hooks.ralph, { loop_interval: 5 });
+    // user entry survives
+    assert.strictEqual(config.hooks.PreToolUse.length, 1);
+    assert.strictEqual(config.hooks.PreToolUse[0].id, "user:PreToolUse");
+    // Empty event keys are deleted
+    assert.strictEqual(config.hooks.SessionStart, undefined);
   });
 });
 
-describe("ensureSecurityHooksArray", () => {
-  it("creates security.hooks array when missing", () => {
+describe("ensureHooksMapping", () => {
+  it("creates hooks={} when missing", () => {
     const config = {};
-    const hooks = ensureSecurityHooksArray(config);
-    assert.ok(Array.isArray(hooks));
-    assert.strictEqual(hooks.length, 0);
-    assert.strictEqual(config.security.hooks, hooks);
+    const mapping = ensureHooksMapping(config);
+    assert.ok(mapping !== null);
+    assert.deepStrictEqual(config.hooks, {});
   });
 
-  it("returns null when security is array (incompatible)", () => {
-    const config = { security: [] };
-    assert.strictEqual(ensureSecurityHooksArray(config), null);
+  it("returns null when hooks is an array", () => {
+    const config = { hooks: [] };
+    assert.strictEqual(ensureHooksMapping(config), null);
   });
 
-  it("returns null when security.hooks is not array", () => {
-    const config = { security: { hooks: "not-array" } };
-    assert.strictEqual(ensureSecurityHooksArray(config), null);
+  it("returns null when hooks is a scalar", () => {
+    const config = { hooks: "scalar" };
+    assert.strictEqual(ensureHooksMapping(config), null);
   });
 });
 
 describe("isOurEntry", () => {
-  it("identifies Clawd entries by name prefix", () => {
-    assert.strictEqual(isOurEntry({ name: "clawd-on-desk:session_start" }), true);
-    assert.strictEqual(isOurEntry({ name: "clawd-on-desk:permission_request" }), true);
+  it("identifies entries by OUR_ID_PREFIX", () => {
+    assert.strictEqual(isOurEntry({ id: "clawd-on-desk:SessionStart" }), true);
+    assert.strictEqual(isOurEntry({ id: "clawd-on-desk:PermissionRequest" }), true);
   });
 
-  it("rejects non-Clawd entries", () => {
-    assert.strictEqual(isOurEntry({ name: "user-custom-hook" }), false);
-    assert.strictEqual(isOurEntry({ name: "clawd-on-desk-custom" }), false);
+  it("rejects non-prefixed, empty, and null entries", () => {
+    assert.strictEqual(isOurEntry({ id: "user-custom:PreToolUse" }), false);
     assert.strictEqual(isOurEntry({}), false);
     assert.strictEqual(isOurEntry(null), false);
   });

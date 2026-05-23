@@ -1,36 +1,38 @@
 #!/usr/bin/env node
-// Merge Clawd Nano Agent hooks into ~/.config/nano/config.yaml (append-only, idempotent)
-// Nano Agent uses Go hookservice with YAML config format and SSRF protection.
+// Merge Clawd Nano Agent hooks into ~/.config/nano/config.yaml (per-event mapping, idempotent)
+// Post-PR-210 contract: top-level `hooks:` mapping keyed by PascalCase event names,
+// `HookCommand.Id` as canonical ownership field, JSON envelope on stdin.
 
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const yaml = require("js-yaml");
-const { resolveNodeBin, buildPermissionUrl, DEFAULT_SERVER_PORT, readRuntimePort } = require("./server-config");
-const { asarUnpackedPath, extractExistingNodeBin } = require("./json-utils");
+const { resolveNodeBin } = require("./server-config");
+const { asarUnpackedPath } = require("./json-utils");
 
-const HOOK_NAME_PREFIX = "clawd-on-desk:";
+const OUR_ID_PREFIX = "clawd-on-desk:";
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".config", "nano", "config.yaml");
+const DEFAULT_HOOK_TIMEOUT_SECONDS = 30;
+const PERMISSION_HOOK_TIMEOUT_SECONDS = 600;
 
-// Command hooks (fire-and-forget state reporting)
-const NANO_COMMAND_HOOK_EVENTS = [
-  "session_start",
-  "session_end",
-  "user_prompt_submit",
-  "pre_tool_use",
-  "post_tool_use",
-  "post_tool_use_failure",
-  "stop",
-  "stop_failure",
-  "subagent_start",
-  "subagent_stop",
-  "pre_compact",
-  "post_compact",
-  "notification",
+// 12 always-on PascalCase events
+const NANO_HOOK_EVENTS_BASE = [
+  "SessionStart",
+  "SessionEnd",
+  "UserPromptSubmit",
+  "PreToolUse",
+  "PostToolUse",
+  "PostToolUseFailure",
+  "Stop",
+  "StopFailure",
+  "SubagentStart",
+  "SubagentStop",
+  "PreCompact",
+  "PostCompact",
 ];
 
-// HTTP hooks (blocking permission approval)
-const NANO_HTTP_HOOK_EVENTS = ["permission_request"];
+// Optional events gated on prefs
+const NANO_HOOK_EVENTS_OPTIONAL = ["PermissionRequest", "Notification"];
 
 /**
  * Quote a string for POSIX shell (hookservice uses `sh -c`).
@@ -42,7 +44,7 @@ function quoteForShell(value) {
 
 /**
  * Build hook command string for nano-agent.
- * Remote mode prepends CLAWD_REMOTE=1 (must be in env_whitelist).
+ * Remote mode prepends CLAWD_REMOTE=1.
  */
 function buildHookCommand(node, script, event, options = {}) {
   const quotedNode = quoteForShell(node);
@@ -53,60 +55,35 @@ function buildHookCommand(node, script, event, options = {}) {
 }
 
 /**
- * Build a command hook entry for YAML config.
+ * Build a hook entry for the per-event YAML list.
  */
-function buildCommandHookEntry(node, script, event, options = {}) {
+function buildHookEntry(node, script, event, options = {}) {
   const command = buildHookCommand(node, script, event, options);
+  const timeout = event === "PermissionRequest"
+    ? PERMISSION_HOOK_TIMEOUT_SECONDS
+    : DEFAULT_HOOK_TIMEOUT_SECONDS;
   return {
-    name: `${HOOK_NAME_PREFIX}${event}`,
-    event,
-    pattern: "*",
-    type: "command",
+    id: `${OUR_ID_PREFIX}${event}`,
+    matcher: "*",
     command,
-    enabled: true,
-    failure_policy: "allow",  // Don't block user if Clawd is down
-    async: true,
-    env_whitelist: ["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "CLAWD_REMOTE"],
-    status_message: `Clawd: ${event}`,
+    timeout,
   };
 }
 
 /**
- * Build an HTTP hook entry for permission approval.
+ * Ensure config.hooks is a usable mapping (object, not array/scalar).
+ * Creates `config.hooks = {}` if missing.
+ * Returns null if config.hooks exists but is not an object mapping.
  */
-function buildHttpHookEntry(event, url) {
-  return {
-    name: `${HOOK_NAME_PREFIX}${event}`,
-    event,
-    pattern: "*",
-    type: "http",
-    http: {
-      url,
-      method: "POST",
-      timeout_seconds: 600,
-      // CRITICAL: url_allowlist is required by nano-agent's SSRF protection
-      url_allowlist: ["127.0.0.1", "localhost"],
-    },
-    enabled: true,
-    failure_policy: "allow",
-    status_message: `Clawd: ${event}`,
-  };
-}
-
-/**
- * Ensure config.security.hooks is a usable array.
- * Returns null if config shape is incompatible (security is scalar/array).
- */
-function ensureSecurityHooksArray(config) {
-  if (!config.security) config.security = {};
-  if (typeof config.security !== "object" || Array.isArray(config.security)) {
-    return null; // Incompatible shape
+function ensureHooksMapping(config) {
+  if (!config.hooks) {
+    config.hooks = {};
+    return config.hooks;
   }
-  if (!config.security.hooks) config.security.hooks = [];
-  if (!Array.isArray(config.security.hooks)) {
-    return null; // Incompatible shape
+  if (typeof config.hooks !== "object" || Array.isArray(config.hooks)) {
+    return null;
   }
-  return config.security.hooks;
+  return config.hooks;
 }
 
 /**
@@ -133,10 +110,10 @@ function writeYamlAtomic(filePath, data) {
 }
 
 /**
- * Check if an entry belongs to Clawd (by name prefix).
+ * Check if an entry belongs to Clawd (by id prefix).
  */
 function isOurEntry(entry) {
-  return !!(entry && entry.name && entry.name.startsWith(HOOK_NAME_PREFIX));
+  return !!(entry && entry.id && entry.id.startsWith(OUR_ID_PREFIX));
 }
 
 /**
@@ -147,8 +124,9 @@ function isOurEntry(entry) {
  * @param {string} [options.configPath]
  * @param {string} [options.scriptPath]
  * @param {string} [options.nodeBin]
- * @param {number} [options.port]
- * @returns {{ status: string, added?: number, updated?: number, skipped?: number, reason?: string }}
+ * @param {boolean} [options.permissionsEnabled]
+ * @param {boolean} [options.notificationHookEnabled]
+ * @returns {{ status: string, added?: number, updated?: number, skipped?: number, removed?: number, reason?: string }}
  */
 function registerNanoAgentHooks(options = {}) {
   const configPath = options.configPath || DEFAULT_CONFIG_PATH;
@@ -167,71 +145,73 @@ function registerNanoAgentHooks(options = {}) {
     return { status: "error", reason: "config-parse-failed", message: err.message };
   }
 
-  const hooks = ensureSecurityHooksArray(config);
-  if (!hooks) {
-    if (!options.silent) console.error("Clawd: config.security.hooks is not usable (incompatible shape)");
+  const mapping = ensureHooksMapping(config);
+  if (!mapping) {
+    if (!options.silent) console.error("Clawd: config.hooks is not a mapping (incompatible shape)");
     return { status: "error", reason: "config-shape-incompatible" };
   }
 
   const scriptPath = options.scriptPath ||
     asarUnpackedPath(path.resolve(__dirname, "nano-agent-hook.js").replace(/\\/g, "/"));
   const nodeBin = options.nodeBin !== undefined ? options.nodeBin : (resolveNodeBin() || "node");
-  const port = options.port || readRuntimePort() || DEFAULT_SERVER_PORT;
-  const permissionUrl = buildPermissionUrl(port);
 
-  // Build desired hook set
-  const desired = [];
-  for (const event of NANO_COMMAND_HOOK_EVENTS) {
-    desired.push(buildCommandHookEntry(nodeBin, scriptPath, event, options));
-  }
-  for (const event of NANO_HTTP_HOOK_EVENTS) {
-    desired.push(buildHttpHookEntry(event, permissionUrl));
-  }
+  const permissionsEnabled = options.permissionsEnabled !== false;
+  const notificationHookEnabled = options.notificationHookEnabled !== false;
 
-  const desiredByName = new Map(desired.map((e) => [e.name, e]));
+  // Build active event list
+  const activeEvents = [
+    ...NANO_HOOK_EVENTS_BASE,
+    ...(permissionsEnabled ? ["PermissionRequest"] : []),
+    ...(notificationHookEnabled ? ["Notification"] : []),
+  ];
+
   let added = 0;
   let updated = 0;
   let skipped = 0;
+  let removed = 0;
 
-  // In-place replacement: update existing entries, mark others for addition
-  const newHooks = [];
-  for (const entry of hooks) {
-    if (!isOurEntry(entry)) {
-      newHooks.push(entry);
-      continue;
+  // Register active events
+  for (const event of activeEvents) {
+    const list = mapping[event];
+    // If value exists but isn't an array → incompatible shape
+    if (list !== undefined && !Array.isArray(list)) {
+      if (!options.silent) console.error(`Clawd: hooks.${event} is not a list (incompatible shape)`);
+      return { status: "error", reason: "config-shape-incompatible" };
     }
-    const desiredEntry = desiredByName.get(entry.name);
-    if (!desiredEntry) {
-      // Stale entry (not in desired set) — skip for uninstall to clean
-      continue;
-    }
-    // Check if update needed (deep structural equality)
-    if (JSON.stringify(entry) === JSON.stringify(desiredEntry)) {
-      newHooks.push(entry);
-      desiredByName.delete(entry.name);
+    if (!mapping[event]) mapping[event] = [];
+
+    const desiredEntry = buildHookEntry(nodeBin, scriptPath, event, options);
+    const existingIdx = mapping[event].findIndex((e) => isOurEntry(e));
+
+    if (existingIdx === -1) {
+      mapping[event].push(desiredEntry);
+      added++;
+    } else if (JSON.stringify(mapping[event][existingIdx]) === JSON.stringify(desiredEntry)) {
       skipped++;
     } else {
-      newHooks.push(desiredEntry);
-      desiredByName.delete(entry.name);
+      mapping[event][existingIdx] = desiredEntry;
       updated++;
     }
   }
 
-  // Add remaining desired entries
-  for (const entry of desiredByName.values()) {
-    newHooks.push(entry);
-    added++;
+  // Sweep optional events that are now off
+  for (const event of NANO_HOOK_EVENTS_OPTIONAL) {
+    if (activeEvents.includes(event)) continue;
+    if (!Array.isArray(mapping[event])) continue;
+    const before = mapping[event].length;
+    mapping[event] = mapping[event].filter((e) => !isOurEntry(e));
+    removed += before - mapping[event].length;
+    if (mapping[event].length === 0) delete mapping[event];
   }
 
-  config.security.hooks = newHooks;
   writeYamlAtomic(configPath, config);
 
   if (!options.silent) {
     console.log(`Clawd Nano Agent hooks → ${configPath}`);
-    console.log(`  Added: ${added}, updated: ${updated}, skipped: ${skipped}`);
+    console.log(`  Added: ${added}, updated: ${updated}, skipped: ${skipped}, removed: ${removed}`);
   }
 
-  return { status: "ok", added, updated, skipped };
+  return { status: "ok", added, updated, skipped, removed };
 }
 
 /**
@@ -253,14 +233,20 @@ function unregisterNanoAgentHooks(options = {}) {
     return { status: "error", reason: "config-parse-failed", message: err.message };
   }
 
-  if (!config.security || !Array.isArray(config.security.hooks)) {
-    if (!options.silent) console.log("Clawd: no hooks array found — nothing to uninstall");
+  if (!config.hooks || typeof config.hooks !== "object" || Array.isArray(config.hooks)) {
+    if (!options.silent) console.log("Clawd: no hooks mapping found — nothing to uninstall");
     return { status: "skipped", reason: "no-hooks" };
   }
 
-  const before = config.security.hooks.length;
-  config.security.hooks = config.security.hooks.filter((entry) => !isOurEntry(entry));
-  const removed = before - config.security.hooks.length;
+  let removed = 0;
+  const allEvents = [...NANO_HOOK_EVENTS_BASE, ...NANO_HOOK_EVENTS_OPTIONAL];
+  for (const event of allEvents) {
+    if (!Array.isArray(config.hooks[event])) continue;
+    const before = config.hooks[event].length;
+    config.hooks[event] = config.hooks[event].filter((e) => !isOurEntry(e));
+    removed += before - config.hooks[event].length;
+    if (config.hooks[event].length === 0) delete config.hooks[event];
+  }
 
   if (removed > 0) {
     writeYamlAtomic(configPath, config);
@@ -276,17 +262,19 @@ function unregisterNanoAgentHooks(options = {}) {
 
 module.exports = {
   DEFAULT_CONFIG_PATH,
-  HOOK_NAME_PREFIX,
-  NANO_COMMAND_HOOK_EVENTS,
-  NANO_HTTP_HOOK_EVENTS,
+  DEFAULT_HOOK_TIMEOUT_SECONDS,
+  PERMISSION_HOOK_TIMEOUT_SECONDS,
+  OUR_ID_PREFIX,
+  NANO_HOOK_EVENTS_BASE,
+  NANO_HOOK_EVENTS_OPTIONAL,
   registerNanoAgentHooks,
   unregisterNanoAgentHooks,
   quoteForShell,
   buildHookCommand,
-  buildCommandHookEntry,
-  buildHttpHookEntry,
-  ensureSecurityHooksArray,
+  buildHookEntry,
+  ensureHooksMapping,
   isOurEntry,
+  writeYamlAtomic,
 };
 
 if (require.main === module) {

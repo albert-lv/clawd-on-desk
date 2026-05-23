@@ -5,6 +5,7 @@ function createIntegrationSyncRuntime(options = {}) {
   const getHookServerPort = options.getHookServerPort;
   const shouldManageClaudeHooks = options.shouldManageClaudeHooks;
   const isAgentEnabled = options.isAgentEnabled;
+  const getAgentPrefs = options.getAgentPrefs;
   const startClaudeSettingsWatcher = options.startClaudeSettingsWatcher;
   const stopClaudeSettingsWatcher = options.stopClaudeSettingsWatcher;
 
@@ -256,7 +257,12 @@ function createIntegrationSyncRuntime(options = {}) {
     try {
       if (typeof ctx.syncNanoAgentHooksImpl === "function") return ctx.syncNanoAgentHooksImpl();
       const { registerNanoAgentHooks } = require("../hooks/nano-agent-install.js");
-      const { added, updated } = registerNanoAgentHooks({ silent: true, port: getHookServerPort() });
+      const prefs = (typeof getAgentPrefs === "function" && getAgentPrefs("nano-agent")) || {};
+      const { added, updated } = registerNanoAgentHooks({
+        silent: true,
+        permissionsEnabled: prefs.permissionsEnabled !== false,
+        notificationHookEnabled: prefs.notificationHookEnabled !== false,
+      });
       if (added > 0 || updated > 0) {
         console.log(`Clawd: synced Nano Agent hooks (added ${added}, updated ${updated})`);
       }
