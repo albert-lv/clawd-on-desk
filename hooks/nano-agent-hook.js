@@ -37,9 +37,9 @@ const EVENT_TO_STATE = {
  * Read hook envelope from stdin (JSON).
  * Returns parsed object or {} on any error.
  */
-function readHookEnvelopeFromStdin() {
+function readHookEnvelopeFromStdin(readSync) {
   try {
-    const raw = fs.readFileSync(0, "utf-8");
+    const raw = (readSync || (() => fs.readFileSync(0, "utf-8")))();
     if (!raw || !raw.trim()) return {};
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
